@@ -1,0 +1,9 @@
+"AddonInfo"
+{
+	"name"			"gmod_mcp bridge (DEV ONLY)"
+	"version"		"0.1.0"
+	"author_name"		"TheFirstyForever"
+	"info"			"DEBUG BRIDGE - remove before publishing"
+	"mount"			"1"
+	"type"			"other"
+}
