@@ -375,19 +375,23 @@ fresh errors.
 
 ```
 gmod_status()
-→ 'gmod running=True server=alive client=alive menu=alive | gamemode=sandbox fullscreen=1'
+→ 'gmod running=True proc=gmod.exe x5 server=alive client=alive menu=alive | map=gm_flatgrass gamemode=sandbox | fullscreen=1'
 ```
+
+`proc` — found game processes (`<exe> x<count>`); the detailed
+per-PID listing lives in `gmod_proc`.
 
 **Edge case:** `gamemode` may reflect a ConVar rather than the loaded
 mode — verify `engine.ActiveGamemode()` in the server realm.
 
 ---
 
-## gmod_launch / gmod_restart / gmod_map
+## gmod_launch / gmod_restart / gmod_stop / gmod_map
 
 ```
-gmod_launch([mapname='gm_construct', gamemode='', extra_args=''])
-gmod_restart([mapname='gm_construct', gamemode=''])
+gmod_launch([mapname='gm_construct', gamemode='', extra_args='', wait=0])
+gmod_restart([mapname='gm_construct', gamemode='', extra_args='', wait=0])
+gmod_stop()
 gmod_map(map='gm_flatgrass' [, gamemode=''])
 ```
 
@@ -396,14 +400,83 @@ gmod_map(map='gm_flatgrass' [, gamemode=''])
 | mapname/map | map name without `.bsp`; empty `mapname` = launch into the main menu |
 | gamemode | gamemode folder name (`sandbox`, `jazztronauts`, ...) |
 | extra_args | appended verbatim to the command line (`+maxplayers 2`) |
+| wait | seconds to wait for the realm to come alive (`client` when a map is given, `menu` otherwise); `0` = don't wait. Reply gains `| client=alive` or `| TIMEOUT waiting client realm` |
+
+`gmod_stop` first tries a graceful `quit` via a live realm, then
+falls back to `taskkill`.
 
 **Edge cases:**
 - `gmod_launch` replies `already running` if the game process is alive.
-- `gmod_restart` has no `extra_args` — for Jazztronauts use
-  `gmod_launch` with `+maxplayers 2` (singleplayer is forbidden by the
-  gamemode).
+- For Jazztronauts pass `extra_args='+maxplayers 2'` (singleplayer is
+  forbidden by the gamemode); a `gamemode` cvar + `map` on a running
+  listen server does NOT switch the active gamemode — restart.
 - `gmod_map` uses `changelevel` in-game; empty `map` — UsageError.
 - `changelevel` may silently no-op — verify with `game.GetMap()`.
+
+---
+
+## gmod_proc — process management
+
+```
+gmod_proc(action='status')   → one line per process:
+   'gmod pid=19476 mem=682MB start=... exe=...\bin\win64\gmod.exe'
+gmod_proc(action='focus')    → 'focused pid=19476' — restores and
+                               foregrounds the game window
+gmod_proc(action='kill')     → 'killed' (taskkill /F)
+```
+
+`focus` matters because the menu realm sleeps while the game window
+is minimized — restore the window before menu-realm commands.
+
+---
+
+## gmod_log — console.log tail
+
+```
+gmod_log(lines=40 [, match='gmod_mcp'])
+```
+
+Reads the tail of `garrysmod/console.log` (the game must run with
+`-condebug` — `gmod_launch` adds it). `match` is a case-insensitive
+substring filter.
+
+---
+
+## gmod_deploy — sync repo addons into the game
+
+```
+gmod_deploy(addon='all')
+gmod_deploy(addon='jazz_reborn_core')
+```
+
+Mirrors addon directories from the repository into
+`garrysmod/addons/` copying only changed files (missing / size /
+mtime). Sources are resolved inside the repo (located via the exe
+path `.../_devtools/gmod-mcp/gmod-mcp.exe`; override with env
+`GMOD_REPO`): `garrysmod/addons/<name>` is preferred over
+`<repo>/<name>` when both exist.
+
+`all` deploys `jazz_reborn_core`, `jazz_reborn_tools`,
+`jazz_round_modifiers`, `gmod_mcp`. For `gmod_mcp` it also syncs
+`addon/lua/menu/gmod_mcp_menu.lua` → `garrysmod/lua/menu/` and
+appends `include("menu/gmod_mcp_menu.lua")` to `init_menu.lua` when
+missing.
+
+In-game realms pick changed Lua up via Auto Refresh; the menu realm
+needs a game restart (or the `GMOD_MCP_MENU_LOADED` + `RunString`
+hot-reload trick).
+
+---
+
+## gmod_runfile — run a Lua file in a realm
+
+```
+gmod_runfile(realm='server', path='_devtools/jrb_tests/smoke_compile_tank.lua')
+```
+
+`path` is absolute or repo-relative. The file contents are executed
+with `RunString` semantics (30s timeout) — the documented way to run
+`_devtools/jrb_tests` smoke tests.
 
 ---
 

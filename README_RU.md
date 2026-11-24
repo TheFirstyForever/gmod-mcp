@@ -371,19 +371,23 @@ gmod_errors()
 
 ```
 gmod_status()
-→ 'gmod running=True server=alive client=alive menu=alive | gamemode=sandbox fullscreen=1'
+→ 'gmod running=True proc=gmod.exe x5 server=alive client=alive menu=alive | map=gm_flatgrass gamemode=sandbox | fullscreen=1'
 ```
+
+`proc` — найденные процессы игры (`<exe> x<число>`); подробный
+список по PID'ам даёт `gmod_proc`.
 
 **Краевой случай:** `gamemode` может отражать ConVar, а не загруженный
 режим — проверяй `engine.ActiveGamemode()` в server realm.
 
 ---
 
-## gmod_launch / gmod_restart / gmod_map
+## gmod_launch / gmod_restart / gmod_stop / gmod_map
 
 ```
-gmod_launch([mapname='gm_construct', gamemode='', extra_args=''])
-gmod_restart([mapname='gm_construct', gamemode=''])
+gmod_launch([mapname='gm_construct', gamemode='', extra_args='', wait=0])
+gmod_restart([mapname='gm_construct', gamemode='', extra_args='', wait=0])
+gmod_stop()
 gmod_map(map='gm_flatgrass' [, gamemode=''])
 ```
 
@@ -392,13 +396,83 @@ gmod_map(map='gm_flatgrass' [, gamemode=''])
 | mapname/map | имя карты без `.bsp`; пустой `mapname` = загрузка в главное меню |
 | gamemode | имя папки геймода (`sandbox`, `jazztronauts`, ...) |
 | extra_args | добавляется в командную строку как есть (`+maxplayers 2`) |
+| wait | секунд ожидания живости реалма (`client` при заданной карте, иначе `menu`); `0` = не ждать. В ответ добавляется `| client=alive` или `| TIMEOUT waiting client realm` |
+
+`gmod_stop` сначала пробует корректный `quit` через живой реалм,
+при неудаче — `taskkill`.
 
 **Краевые случаи:**
 - `gmod_launch` отвечает `already running`, если процесс игры жив.
-- `gmod_restart` не имеет `extra_args` — для Jazztronauts используй
-  `gmod_launch` с `+maxplayers 2` (singleplayer запрещён геймодом).
+- Для Jazztronauts передавай `extra_args='+maxplayers 2'` (singleplayer
+  запрещён геймодом); `gamemode` cvar + `map` на живом listen-сервере
+  НЕ переключает активный геймод — нужен перезапуск.
 - `gmod_map` в игре использует `changelevel`; пустой `map` — UsageError.
 - `changelevel` может молча не сработать — проверяй `game.GetMap()`.
+
+---
+
+## gmod_proc — управление процессом
+
+```
+gmod_proc(action='status')   → по строке на процесс:
+   'gmod pid=19476 mem=682MB start=... exe=...\bin\win64\gmod.exe'
+gmod_proc(action='focus')    → 'focused pid=19476' — разворачивает и
+                               выводит окно игры на передний план
+gmod_proc(action='kill')     → 'killed' (taskkill /F)
+```
+
+`focus` важен, потому что menu-реалм спит, пока окно игры свёрнуто —
+разверни окно перед командами в menu-realm.
+
+---
+
+## gmod_log — хвост console.log
+
+```
+gmod_log(lines=40 [, match='gmod_mcp'])
+```
+
+Читает хвост `garrysmod/console.log` (игра должна быть запущена с
+`-condebug` — `gmod_launch` добавляет его). `match` —
+регистронезависимый фильтр-подстрока.
+
+---
+
+## gmod_deploy — синхронизация аддонов репо в игру
+
+```
+gmod_deploy(addon='all')
+gmod_deploy(addon='jazz_reborn_core')
+```
+
+Зеркалит папки аддонов из репозитория в `garrysmod/addons/`,
+копируя только изменённые файлы (отсутствует / размер / mtime).
+Источники ищутся внутри репозитория (корень вычисляется по пути к
+exe `.../_devtools/gmod-mcp/gmod-mcp.exe`; переопределяется env
+`GMOD_REPO`): при наличии `garrysmod/addons/<name>` берётся оно,
+иначе `<репо>/<name>`.
+
+`all` деплоит `jazz_reborn_core`, `jazz_reborn_tools`,
+`jazz_round_modifiers`, `gmod_mcp`. Для `gmod_mcp` дополнительно
+синхронизируется `addon/lua/menu/gmod_mcp_menu.lua` →
+`garrysmod/lua/menu/` и добавляется
+`include("menu/gmod_mcp_menu.lua")` в `init_menu.lua`, если его нет.
+
+Игровые реалмы подхватывают изменённые Lua через Auto Refresh;
+menu-реалм требует перезапуска игры (или приём с хотрелоадом
+`GMOD_MCP_MENU_LOADED` + `RunString`).
+
+---
+
+## gmod_runfile — выполнить Lua-файл в реалме
+
+```
+gmod_runfile(realm='server', path='_devtools/jrb_tests/smoke_compile_tank.lua')
+```
+
+`path` — абсолютный или относительно корня репозитория. Содержимое
+файла выполняется с семантикой `RunString` (таймаут 30с) — это
+задокументированный способ запуска smoke-тестов `_devtools/jrb_tests`.
 
 ---
 

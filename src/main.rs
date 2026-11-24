@@ -190,6 +190,8 @@ fn tools() -> Value {
                 через +map в аргументах запуска. gamemode — имя папки геймода \
                 (sandbox/terrortown/jazztronauts/...), передаётся как +gamemode. \
                 Пустой mapname — запуск без карты (сразу главное меню). \
+                wait — секунд ожидания живости реалма (client при mapname, \
+                иначе menu; 0 = не ждать). \
                 Для Jazztronauts: mapname='', gamemode='jazztronauts', \
                 extra_args='+maxplayers 2'; затем map gm_construct из menu-realm. \
                 Иначе +map может выполниться раньше +gamemode, а Singleplayer \
@@ -201,6 +203,7 @@ fn tools() -> Value {
                     "mapname": {"type": "string", "default": "gm_construct"},
                     "gamemode": {"type": "string", "default": ""},
                     "extra_args": {"type": "string", "default": ""},
+                    "wait": {"type": "number", "default": 0},
                 },
             },
         },
@@ -209,17 +212,98 @@ fn tools() -> Value {
             "description": (
                 "Полный перезапуск GMod: завершает процесс игры и запускает заново. \
                 РАЗРЕШЁН пользователем для ускорения итераций. mapname — карта для \
-                автозагрузки, gamemode — папка геймода (+gamemode). \
-                Пустой mapname — запуск без карты (главное меню). \
-                Для Jazztronauts нужен +maxplayers 2; у этого инструмента нет \
-                extra_args. Закрой игру и используй gmod_launch по AGENTS.md."
+                автозагрузки, gamemode — папка геймода (+gamemode), \
+                extra_args — прочие аргументы командной строки (например \
+                '+maxplayers 2' для Jazztronauts), wait — секунд ожидания \
+                живости реалма. Пустой mapname — запуск без карты (главное меню)."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "mapname": {"type": "string", "default": "gm_construct"},
                     "gamemode": {"type": "string", "default": ""},
+                    "extra_args": {"type": "string", "default": ""},
+                    "wait": {"type": "number", "default": 0},
                 },
+            },
+        },
+        {
+            "name": "gmod_proc",
+            "description": (
+                "Управление процессом игры. action=status|list — найденные \
+                процессы gmod*/hl2: pid, путь к exe, аптайм, память, окно. \
+                action=focus — развернуть и вывести окно игры на передний \
+                план (нужно для menu-realm, который спит на свёрнутом окне). \
+                action=kill — принудительное завершение (taskkill /F)."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "list", "focus", "foreground", "kill"],
+                        "default": "status",
+                    },
+                },
+            },
+        },
+        {
+            "name": "gmod_stop",
+            "description": (
+                "Завершить игру: сначала корректный quit через консоль живого \
+                реалма, при неудаче — taskkill. Процесс должен завершиться."
+            ),
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "gmod_log",
+            "description": (
+                "Хвост garrysmod/console.log (нужен запуск с -condebug — \
+                gmod_launch добавляет его). lines — сколько строк вернуть \
+                (деф.40), match — необязательный фильтр-подстрока \
+                (регистронезависимая, например 'ERROR' или 'gmod_mcp')."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "lines": {"type": "number", "default": 40},
+                    "match": {"type": "string", "default": ""},
+                },
+            },
+        },
+        {
+            "name": "gmod_deploy",
+            "description": (
+                "Синхронизировать аддоны репозитория в garrysmod/addons — \
+                копирует только изменённые файлы. addon='all' (деф.) — все \
+                известные аддоны (jazz_reborn_core, jazz_reborn_tools, \
+                jazz_round_modifiers, gmod_mcp); иначе имя аддона. Для \
+                gmod_mcp дополнительно обновляет lua/menu/gmod_mcp_menu.lua \
+                и добавляет include в init_menu.lua при отсутствии. \
+                GMod сам подхватит изменённые Lua-файлы через autorefresh; \
+                menu-реалм требует перезапуска игры."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "addon": {"type": "string", "default": "all"},
+                },
+            },
+        },
+        {
+            "name": "gmod_runfile",
+            "description": (
+                "Выполнить Lua-файл в реалме (RunString-семантика, как у \
+                smoke-тестов _devtools/jrb_tests). path — абсолютный или \
+                относительно корня репозитория. Таймаут 30с."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "realm": {"type": "string", "enum": ["server", "client", "menu"]},
+                    "path": {"type": "string"},
+                },
+                "required": ["realm", "path"],
             },
         },
         {
@@ -1053,18 +1137,33 @@ fn gmod_console(realm: &str, command: &str) -> String {
     gmod_lua(realm, &code, Duration::from_secs(15))
 }
 
-fn hl2_running() -> bool {
-    match Command::new("tasklist")
-        .arg("/NH")
-        .stderr(Stdio::null())
-        .output()
-    {
-        Ok(o) => {
-            let out = String::from_utf8_lossy(&o.stdout);
-            GMOD_PROCS.iter().any(|p| out.contains(*p))
+/// (exe, pid) всех процессов игры через tasklist CSV.
+fn gmod_procs() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for p in GMOD_PROCS {
+        let res = Command::new("tasklist")
+            .args(["/FI", &format!("IMAGENAME eq {p}"), "/FO", "CSV", "/NH"])
+            .stderr(Stdio::null())
+            .output();
+        if let Ok(o) = res {
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                // "gmod_win64.exe","1234","Console","1","123,456 K"
+                let f: Vec<&str> = line.split("\",\"").collect();
+                if f.len() >= 2 {
+                    let name = f[0].trim_matches('"');
+                    let pid = f[1].trim_matches('"');
+                    if name.eq_ignore_ascii_case(p) && pid.chars().all(|c| c.is_ascii_digit()) {
+                        out.push((name.to_string(), pid.to_string()));
+                    }
+                }
+            }
         }
-        Err(_) => false,
     }
+    out
+}
+
+fn hl2_running() -> bool {
+    !gmod_procs().is_empty()
 }
 
 fn realm_alive(realm: &str, timeout: Duration) -> bool {
@@ -1085,9 +1184,22 @@ fn realm_alive(realm: &str, timeout: Duration) -> bool {
 }
 
 fn gmod_status() -> String {
-    if !hl2_running() {
+    let procs = gmod_procs();
+    if procs.is_empty() {
         return "gmod running=False bridge=n/a".into();
     }
+    // сжато: "gmod.exe x5" — полный список с pid'ами даёт gmod_proc
+    let mut names: Vec<String> = procs.iter().map(|(n, _)| n.clone()).collect();
+    names.sort();
+    names.dedup();
+    let procs_s = names
+        .iter()
+        .map(|n| {
+            let c = procs.iter().filter(|(p, _)| p == n).count();
+            if c > 1 { format!("{n} x{c}") } else { n.clone() }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     // три реалма пингуем параллельно — иначе 3 последовательных
     // round-trip'а утраивают задержку статуса
     let handles: Vec<_> = ["server", "client", "menu"]
@@ -1126,7 +1238,8 @@ fn gmod_status() -> String {
         }
     }
     format!(
-        "gmod running=True server={} client={} menu={}{}{}",
+        "gmod running=True proc={} server={} client={} menu={}{}{}",
+        procs_s,
         realms["server"].as_str().unwrap_or("?"),
         realms["client"].as_str().unwrap_or("?"),
         realms["menu"].as_str().unwrap_or("?"),
@@ -1135,7 +1248,26 @@ fn gmod_status() -> String {
     )
 }
 
-fn gmod_launch(mapname: &str, gamemode: &str, extra_args: &str) -> String {
+/// Ждёт живости реалма не дольше `secs` (0 — не ждать).
+/// Для запуска с картой ждём client (карта загружена), без карты — menu.
+fn wait_realm(mapname: &str, secs: u64) -> String {
+    if secs == 0 {
+        return String::new();
+    }
+    let realm = if mapname.is_empty() { "menu" } else { "client" };
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if realm_alive(realm, Duration::from_secs(3)) {
+            return format!(" | {realm}=alive");
+        }
+        if Instant::now() >= deadline {
+            return format!(" | TIMEOUT waiting {realm} realm");
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+fn gmod_launch(mapname: &str, gamemode: &str, extra_args: &str, wait: u64) -> String {
     if hl2_running() {
         return "already running".into();
     }
@@ -1160,28 +1292,32 @@ fn gmod_launch(mapname: &str, gamemode: &str, extra_args: &str) -> String {
         .stdin(Stdio::null())
         .spawn()
     {
-        Ok(_) => format!("launching: {cmdline}"),
+        Ok(_) => format!("launching: {cmdline}{}", wait_realm(mapname, wait)),
         Err(e) => format!("OSError: {e}"),
     }
 }
 
-fn gmod_restart(mapname: &str, gamemode: &str) -> String {
-    if hl2_running() {
-        for proc in GMOD_PROCS {
-            let _ = Command::new("taskkill")
-                .args(["/F", "/IM", proc])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-        for _ in 0..50 {
-            if !hl2_running() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
+fn gmod_kill_all() {
+    for proc in GMOD_PROCS {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/IM", proc])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
-    gmod_launch(mapname, gamemode, "")
+    for _ in 0..50 {
+        if !hl2_running() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn gmod_restart(mapname: &str, gamemode: &str, extra_args: &str, wait: u64) -> String {
+    if hl2_running() {
+        gmod_kill_all();
+    }
+    gmod_launch(mapname, gamemode, extra_args, wait)
 }
 
 fn gmod_map(mapname: &str, gamemode: &str) -> String {
@@ -1215,6 +1351,351 @@ fn gmod_map(mapname: &str, gamemode: &str) -> String {
         gmod_console(realm, &format!("gamemode {gamemode}"));
     }
     gmod_console(realm, &format!("map {mapname}"))
+}
+
+/// Корень установки Garry's Mod (.../GarrysMod), производный от gmod_exe().
+fn gmod_root() -> PathBuf {
+    let exe = PathBuf::from(gmod_exe());
+    // bin/win64/gmod.exe → подняться на 3 уровня; <root>/gmod*.exe → на 1
+    if exe.parent().is_some_and(|p| p.ends_with(Path::new("bin/win64"))) {
+        exe.ancestors().nth(3).map(Path::to_path_buf)
+    } else {
+        exe.parent().map(Path::to_path_buf)
+    }
+    .unwrap_or_else(|| PathBuf::from(r"C:\Program Files (x86)\Steam\steamapps\common\GarrysMod"))
+}
+
+/// Корень репозитория (родитель _devtools/), производный от пути к exe.
+fn repo_root() -> Option<PathBuf> {
+    if let Some(v) = env::var_os("GMOD_REPO") {
+        return Some(PathBuf::from(v));
+    }
+    let d = env::current_exe().ok()?.parent()?.to_path_buf();
+    let dev = d.parent()?;
+    if dev.file_name()?.to_str()? == "_devtools" {
+        dev.parent().map(Path::to_path_buf)
+    } else {
+        None
+    }
+}
+
+/// Детали процессов игры через PowerShell (путь, аптайм, память, окно).
+fn ps_procs() -> Vec<Value> {
+    let script = "Get-Process gmod,gmod_win64,hl2 -ErrorAction SilentlyContinue \
+                  | Select-Object Id,ProcessName,Path,StartTime,WorkingSet64,Responding,MainWindowTitle \
+                  | ConvertTo-Json -Compress";
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-Command", script])
+        .stderr(Stdio::null())
+        .output();
+    let Ok(o) = out else { return Vec::new() };
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap_or(Value::Null);
+    match v {
+        Value::Array(a) => a,
+        Value::Object(_) => vec![v],
+        _ => Vec::new(),
+    }
+}
+
+fn fmt_proc(p: &Value) -> String {
+    let id = p.get("Id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let name = p.get("ProcessName").and_then(|v| v.as_str()).unwrap_or("?");
+    let mem = p
+        .get("WorkingSet64")
+        .and_then(|v| v.as_i64())
+        .map(|b| format!("{:.0}MB", b as f64 / 1048576.0))
+        .unwrap_or_else(|| "?".into());
+    let path = p.get("Path").and_then(|v| v.as_str()).unwrap_or("?");
+    let start = p.get("StartTime").and_then(|v| v.as_str()).unwrap_or("?");
+    let win = p.get("MainWindowTitle").and_then(|v| v.as_str()).unwrap_or("");
+    let win_s = if win.is_empty() { " no-window" } else { "" };
+    format!("{name} pid={id} mem={mem} start={start}{win_s} exe={path}")
+}
+
+fn gmod_proc_tool(a: &Map<String, Value>) -> String {
+    let action = a.get("action").and_then(|v| v.as_str()).unwrap_or("status");
+    match action {
+        "status" | "list" => {
+            let procs = ps_procs();
+            if procs.is_empty() {
+                return "no gmod processes".into();
+            }
+            procs.iter().map(fmt_proc).collect::<Vec<_>>().join("\n")
+        }
+        "focus" | "foreground" => {
+            let script = "$s='[DllImport(\"user32.dll\")] public static extern bool ShowWindowAsync(System.IntPtr h,int s); \
+                [DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(System.IntPtr h);'; \
+                $t=Add-Type -MemberDefinition $s -Name W32F -Namespace U -PassThru; \
+                $p=Get-Process gmod,gmod_win64,hl2 -ErrorAction SilentlyContinue | Where-Object {$_.MainWindowHandle -ne 0} | Select-Object -First 1; \
+                if($p){$t::ShowWindowAsync($p.MainWindowHandle,9)|Out-Null;$t::SetForegroundWindow($p.MainWindowHandle)|Out-Null;\"focused pid=$($p.Id)\"}else{\"no window\"}";
+            match Command::new("powershell")
+                .args(["-NoProfile", "-Command", script])
+                .stderr(Stdio::null())
+                .output()
+            {
+                Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+                Err(e) => format!("OSError: {e}"),
+            }
+        }
+        "kill" => {
+            let had = hl2_running();
+            gmod_kill_all();
+            if had && hl2_running() {
+                "kill failed (still running)".into()
+            } else if had {
+                "killed".into()
+            } else {
+                "not running".into()
+            }
+        }
+        _ => uerr(U_PROC, format!("unknown action '{action}'")),
+    }
+}
+
+fn gmod_stop() -> String {
+    if !hl2_running() {
+        return "not running".into();
+    }
+    // корректный выход через консольную команду любого живого реалма
+    for realm in ["server", "menu"] {
+        if realm_alive(realm, Duration::from_secs(3)) {
+            let _ = gmod_console(realm, "quit");
+            for _ in 0..40 {
+                if !hl2_running() {
+                    return "quit sent, process exited".into();
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            break;
+        }
+    }
+    // fallback — принудительно
+    gmod_kill_all();
+    if hl2_running() {
+        "still running after taskkill".into()
+    } else {
+        "killed via taskkill (graceful quit failed)".into()
+    }
+}
+
+/// Хвост console.log: читает последние ~512КБ файла.
+fn gmod_log(a: &Map<String, Value>) -> String {
+    let n = get_f64(a, "lines", 40.0).max(1.0) as usize;
+    let match_s = a
+        .get("match")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let path = console_log_path();
+    let meta = match fs::metadata(&path) {
+        Ok(m) => m,
+        Err(e) => return format!("OSError: {e} ({})", path.display()),
+    };
+    let len = meta.len();
+    let start = len.saturating_sub(512 * 1024);
+    let mut buf = String::new();
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let Ok(mut f) = fs::File::open(&path) else {
+            return "OSError: cannot open log".into();
+        };
+        let _ = f.seek(SeekFrom::Start(start));
+        let _ = f.read_to_string(&mut buf);
+    }
+    let mut lines: Vec<&str> = buf.lines().collect();
+    if start > 0 && !lines.is_empty() {
+        lines.remove(0); // первая строка усечена серединой
+    }
+    let filtered: Vec<&str> = if match_s.is_empty() {
+        lines
+    } else {
+        lines
+            .into_iter()
+            .filter(|l| l.to_lowercase().contains(&match_s))
+            .collect()
+    };
+    let tail: Vec<&str> = filtered.iter().rev().take(n).rev().cloned().collect();
+    if tail.is_empty() {
+        "(no matching lines)".into()
+    } else {
+        format!("--- console.log ({} lines) ---\n{}", tail.len(), tail.join("\n"))
+    }
+}
+
+/// Рекурсивная синхронизация src → dst: копирует только изменённые
+/// (нет файла / другой размер / более новый mtime). Возвращает
+/// (скопировано, пропущено, список_скопированных).
+fn sync_dir(src: &Path, dst: &Path, copied: &mut Vec<String>) -> Result<u64, String> {
+    let mut skipped = 0u64;
+    let rd = fs::read_dir(src).map_err(|e| format!("OSError: {e} ({})", src.display()))?;
+    for e in rd {
+        let e = e.map_err(|e| e.to_string())?;
+        let name = e.file_name();
+        if name == ".git" {
+            continue;
+        }
+        let s = e.path();
+        let d = dst.join(&name);
+        let ft = e.file_type().map_err(|e| e.to_string())?;
+        if ft.is_dir() {
+            skipped += sync_dir(&s, &d, copied)?;
+            continue;
+        }
+        let sm = e.metadata().map_err(|e| e.to_string())?;
+        let same = fs::metadata(&d).ok().is_some_and(|dm| {
+            dm.len() == sm.len()
+                && dm
+                    .modified()
+                    .ok()
+                    .zip(sm.modified().ok())
+                    .is_some_and(|(a, b)| {
+                        a >= b || b.duration_since(a).unwrap_or_default() < Duration::from_secs(2)
+                    })
+        });
+        if same {
+            skipped += 1;
+            continue;
+        }
+        if let Some(p) = d.parent() {
+            fs::create_dir_all(p).map_err(|e| e.to_string())?;
+        }
+        fs::copy(&s, &d).map_err(|e| format!("OSError: {e} ({})", s.display()))?;
+        copied.push(name.to_string_lossy().into());
+    }
+    Ok(skipped)
+}
+
+/// Исходник аддона в репо по имени (зеркало garrysmod/addons приоритетнее
+/// корня — оно ближе к задеплоенному состоянию).
+fn addon_src(repo: &Path, name: &str) -> Option<(PathBuf, String)> {
+    let cands = [
+        repo.join("garrysmod/addons").join(name),
+        repo.join(name),
+    ];
+    for c in cands {
+        if c.join("addon.txt").exists() {
+            let tag = if c.starts_with(repo.join("garrysmod")) {
+                "garrysmod/addons"
+            } else {
+                "repo root"
+            };
+            return Some((c, tag.into()));
+        }
+    }
+    None
+}
+
+fn gmod_deploy(a: &Map<String, Value>) -> String {
+    let Some(repo) = repo_root() else {
+        return "UsageError: cannot locate repo root (exe must live in _devtools/<dir>/ or set GMOD_REPO)".into();
+    };
+    let garrysmod = gmod_root().join("garrysmod");
+    let addons = garrysmod.join("addons");
+    let name = a
+        .get("addon")
+        .or_else(|| a.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("all");
+
+    // карта деплоя: repo-name → (src, dst)
+    let mut jobs: Vec<(String, PathBuf, PathBuf, String)> = Vec::new();
+    if name == "all" {
+        for n in ["jazz_reborn_core", "jazz_reborn_tools", "jazz_round_modifiers", "gmod_mcp"] {
+            if let Some((s, tag)) = addon_src(&repo, n) {
+                jobs.push((n.into(), s, addons.join(n), tag));
+            }
+        }
+    } else if name == "gmod_mcp" {
+        jobs.push((
+            "gmod_mcp".into(),
+            repo.join("_devtools/gmod-mcp/addon"),
+            addons.join("gmod_mcp"),
+            "_devtools/gmod-mcp/addon".into(),
+        ));
+    } else if let Some((s, tag)) = addon_src(&repo, name) {
+        jobs.push((name.into(), s, addons.join(name), tag));
+    } else {
+        return uerr(
+            U_DEPLOY,
+            format!("addon '{name}' not found in repo (looked in garrysmod/addons/ and repo root)"),
+        );
+    }
+
+    let mut out = Vec::new();
+    for (n, src, dst, tag) in &jobs {
+        if !src.exists() {
+            out.push(format!("{n}: source missing {}", src.display()));
+            continue;
+        }
+        let mut copied = Vec::new();
+        match sync_dir(src, dst, &mut copied) {
+            Ok(sk) => {
+                let list = if copied.is_empty() {
+                    "up to date".into()
+                } else {
+                    format!("copied {} [{}]", copied.len(), copied.join(", "))
+                };
+                out.push(format!("{n} ({tag}): {list}, {sk} unchanged"));
+            }
+            Err(e) => out.push(format!("{n}: {e}")),
+        }
+    }
+
+    // menu-файл моста + include в init_menu.lua (самолечение установки)
+    if name == "all" || name == "gmod_mcp" {
+        let menu_src = repo.join("_devtools/gmod-mcp/addon/lua/menu/gmod_mcp_menu.lua");
+        let menu_dst = garrysmod.join("lua/menu/gmod_mcp_menu.lua");
+        if menu_src.exists() {
+            let same = fs::read(&menu_src)
+                .ok()
+                .zip(fs::read(&menu_dst).ok())
+                .is_some_and(|(a, b)| a == b);
+            if same {
+                out.push("menu lua: up to date".into());
+            } else {
+                if let Some(dir) = menu_dst.parent() {
+                    let _ = fs::create_dir_all(dir);
+                }
+                match fs::copy(&menu_src, &menu_dst) {
+                    Ok(_) => out.push("menu lua: updated".into()),
+                    Err(e) => out.push(format!("menu lua: copy failed {e}")),
+                }
+            }
+        }
+        let init = garrysmod.join("lua/includes/init_menu.lua");
+        if let Ok(txt) = fs::read_to_string(&init) {
+            if !txt.contains("gmod_mcp_menu.lua") {
+                let add = "include(\"menu/gmod_mcp_menu.lua\")\n";
+                match fs::OpenOptions::new().append(true).open(&init) {
+                    Ok(mut f) => {
+                        if f.write_all(add.as_bytes()).is_ok() {
+                            out.push("init_menu.lua: include added".into());
+                        }
+                    }
+                    Err(e) => out.push(format!("init_menu.lua: {e}")),
+                }
+            }
+        }
+    }
+    out.join("\n")
+}
+
+/// Запуск .lua-файла в реалме (smoke-тесты jrb_tests и т.п.).
+/// path — абсолютный или относительно корня репо.
+fn gmod_runfile(realm: &str, path: &str) -> String {
+    let p = PathBuf::from(path);
+    let p = if p.is_absolute() {
+        p
+    } else {
+        match repo_root() {
+            Some(r) => r.join(path),
+            None => p,
+        }
+    };
+    match fs::read_to_string(&p) {
+        Ok(code) => format!("--- {} ---\n{}", p.display(), gmod_lua(realm, &code, Duration::from_secs(30))),
+        Err(e) => format!("OSError: {e} ({})", p.display()),
+    }
 }
 
 fn gmod_display(a: &Map<String, Value>) -> String {
@@ -1656,6 +2137,10 @@ const U_PLAYER: &str = "Usage: gmod_player(action=...) — actions: \
     hold cmd=<name> [on] | stop | \
     speed [walk n] [run n] [jump n] | health [hp n] [armor n] [god] | \
     give class=<entity> [select]";
+const U_PROC: &str =
+    "Usage: gmod_proc(action='status'|'list'|'focus'|'kill')";
+const U_DEPLOY: &str =
+    "Usage: gmod_deploy(addon='all'|'<addon name>')";
 
 fn req_str<'a>(a: &'a Map<String, Value>, k: &str, usage: &str) -> Result<&'a str, String> {
     match a.get(k).and_then(|v| v.as_str()) {
@@ -1714,10 +2199,21 @@ fn call_tool(params: &Map<String, Value>) -> Result<Vec<Value>, String> {
             args.get("mapname").and_then(|v| v.as_str()).unwrap_or("gm_construct"),
             args.get("gamemode").and_then(|v| v.as_str()).unwrap_or(""),
             args.get("extra_args").and_then(|v| v.as_str()).unwrap_or(""),
+            get_f64(args, "wait", 0.0) as u64,
         ))]),
         "gmod_restart" => Ok(vec![text(gmod_restart(
             args.get("mapname").and_then(|v| v.as_str()).unwrap_or("gm_construct"),
             args.get("gamemode").and_then(|v| v.as_str()).unwrap_or(""),
+            args.get("extra_args").and_then(|v| v.as_str()).unwrap_or(""),
+            get_f64(args, "wait", 0.0) as u64,
+        ))]),
+        "gmod_proc" => Ok(vec![text(gmod_proc_tool(args))]),
+        "gmod_stop" => Ok(vec![text(gmod_stop())]),
+        "gmod_log" => Ok(vec![text(gmod_log(args))]),
+        "gmod_deploy" => Ok(vec![text(gmod_deploy(args))]),
+        "gmod_runfile" => Ok(vec![text(gmod_runfile(
+            req_str(args, "realm", "Usage: gmod_runfile(realm='server'|'client'|'menu', path='<file>')")?,
+            req_str(args, "path", "Usage: gmod_runfile(realm='server'|'client'|'menu', path='<file>')")?,
         ))]),
         "gmod_map" => Ok(vec![text(gmod_map(
             args.get("map").and_then(|v| v.as_str()).unwrap_or(""),
@@ -1728,7 +2224,7 @@ fn call_tool(params: &Map<String, Value>) -> Result<Vec<Value>, String> {
         "gmod_menu" => Ok(vec![text(gmod_menu(args)?)]),
         _ => Err(format!(
             "UsageError: unknown tool '{name}'. Available tools: gmod_lua, gmod_batch, \
-             gmod_screenshot, \
+             gmod_screenshot, gmod_proc, gmod_stop, gmod_log, gmod_deploy, gmod_runfile, \
              gmod_view, gmod_camera, gmod_errors, gmod_console, gmod_status, gmod_launch, \
              gmod_restart, gmod_map, gmod_display, gmod_player, gmod_menu"
         )),
