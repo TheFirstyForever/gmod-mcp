@@ -93,7 +93,7 @@ Drop `garrysmod/data/gmod_mcp/cmd_<realm>_<id>.json`:
 ```
 
 Realm prefixes: `cmd_srv_`, `cmd_cl_`, `cmd_menu_`. A poll timer
-(~0.25 s) scans the directory, reads the file, deletes it, runs the
+(~0.02 s) scans the directory, reads the file, deletes it, runs the
 command, and writes the reply. Malformed JSON is discarded silently
 (the file is still consumed).
 
@@ -118,9 +118,10 @@ into console.log and works reliably.
 | kind | Fields | Effect | Reply |
 |---|---|---|---|
 | `lua` | `code` | `RunString` the code (menu has only RunString — no CompileString/loadstring) inside `pcall` | print output + `=>` return |
-| `console` | `command` | `RunConsoleCommand(unpack(words))` | `menu console: <cmd>` / realm ack |
+| `console` | `command` | server: `game.ConsoleCommand(str)`; client/menu: `RunConsoleCommand(unpack(words))` | `menu console: <cmd>` / `console: <cmd>` |
 | `shot` | `pos`,`ang`,`fov`,`hud`,`drawviewer` (in-map) | renders and saves a screenshot | `shot_<id>.jpg` |
 | `cam` | `on`,`pos`,`ang`,`fov` | persistent debug camera (client) | ack |
+| `batch` | `cmds` = array of command objects | runs every sub-command in one round trip; replies joined as `[i] <result>` | joined text |
 
 **Menu-realm only:**
 
@@ -257,6 +258,29 @@ gmod_lua(realm='server', code='return game.GetMap()')
 **Edge cases:** syntax errors → `SYNTAX: ...`; runtime — `ERROR: ...`;
 menu realm lacks `CompileString`/`loadstring` — code goes through
 `RunString` only.
+
+---
+
+## gmod_batch — several commands, one round trip
+
+```
+gmod_batch(realm='server'|'client'|'menu',
+    cmds=[{kind:'lua',code:'...'} | {kind:'console',command:'...'}])
+```
+
+| Parameter | Type | Req. | Notes |
+|---|---|---|---|
+| realm | enum | yes | see realm table |
+| cmds | array | yes | command objects; menu also accepts `js`/`js_eval`, srv/cl accept `shot`/`cam` |
+
+**Returns:** joined sub-replies as `[i] <result>` lines. Sub-commands
+without a `kind`-required field (`code`/`command`) → UsageError.
+Async kinds (`js_eval`, `shot`) reply under `<cid>_<i>`, not inside
+the joined text.
+
+**Edge cases:** nested `batch` kind is rejected; console commands are
+queued by the engine — reading a cvar right after setting it in the
+same batch shows the old value.
 
 ---
 

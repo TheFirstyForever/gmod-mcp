@@ -185,6 +185,40 @@ end
 
 -- ---------- опрос ----------
 
+-- Выполнение одной команды (без чтения файла) — возвращает ответ
+-- или nil, если ответ уйдёт асинхронно (js_eval, shot).
+local function mexec(cmd)
+    if cmd.kind == "console" then
+        -- RunConsoleCommand принимает пары (name, arg)
+        local parts = {}
+        for p in string.gmatch(cmd.command or "", "%S+") do parts[#parts + 1] = p end
+        local cok, cerr = pcall(RunConsoleCommand, unpack(parts))
+        return cok and ("menu console: " .. tostring(cmd.command))
+            or ("ERROR: " .. tostring(cerr))
+    elseif cmd.kind == "shot" then
+        RunConsoleCommand("screenshot")
+        GMOD_MCP.ShotReq = { id = cmd.id, seen = snap_seen(),
+                             t = CurTime() or SysTime() }
+        return "shot requested"
+    elseif cmd.kind == "js" then
+        return mjs(cmd.code)
+    elseif cmd.kind == "js_eval" then
+        -- ответ пишет GMCP_outh асинхронно под cmd.id (в батче — id_<i>)
+        mjs_eval(cmd.id, cmd.code)
+        return nil
+    elseif cmd.kind == "batch" and type(cmd.cmds) == "table" then
+        -- мультиплекс: много команд за один round-trip
+        local parts = {}
+        for i, sub in ipairs(cmd.cmds) do
+            sub.id = sub.id or (cmd.id .. "_" .. i)
+            local r = mexec(sub)
+            if r ~= nil then parts[#parts + 1] = "[" .. i .. "] " .. tostring(r) end
+        end
+        return table.concat(parts, "\n")
+    end
+    return mrun(cmd.code or "")
+end
+
 local function mdispatch(f)
     local path = GMOD_MCP.Dir .. "/" .. f
     local raw = file.Read(path, "DATA")
@@ -192,28 +226,7 @@ local function mdispatch(f)
     -- pcall: кривой JSON не должен убивать тик и съедать команду
     local ok, cmd = pcall(util.JSONToTable, raw or "")
     if not (ok and cmd and cmd.id) then return end
-    local res
-    if cmd.kind == "console" then
-        -- RunConsoleCommand принимает пары (name, arg)
-        local parts = {}
-        for p in string.gmatch(cmd.command or "", "%S+") do parts[#parts + 1] = p end
-        local cok, cerr = pcall(RunConsoleCommand, unpack(parts))
-        res = cok and ("menu console: " .. tostring(cmd.command))
-            or ("ERROR: " .. tostring(cerr))
-    elseif cmd.kind == "shot" then
-        RunConsoleCommand("screenshot")
-        GMOD_MCP.ShotReq = { id = cmd.id, seen = snap_seen(),
-                             t = CurTime() or SysTime() }
-        res = "shot requested"
-    elseif cmd.kind == "js" then
-        res = mjs(cmd.code)
-    elseif cmd.kind == "js_eval" then
-        -- out_<id>_* пишет GMCP_outh асинхронно
-        mjs_eval(cmd.id, cmd.code)
-        res = nil
-    else
-        res = mrun(cmd.code or "")
-    end
+    local res = mexec(cmd)
     if res ~= nil then mwrite_out(cmd.id, res) end
 end
 
@@ -237,7 +250,7 @@ local function mtick()
 end
 
 if timer then
-    timer.Create("GmodMcpMenuPoll", 0.25, 0, mtick)
+    timer.Create("GmodMcpMenuPoll", 0.02, 0, mtick)
 else
     hook.Add("Think", "GmodMcpMenuPoll", mtick)
 end

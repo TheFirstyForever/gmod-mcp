@@ -73,6 +73,25 @@ fn tools() -> Value {
             },
         },
         {
+            "name": "gmod_batch",
+            "description": (
+                "Несколько команд за один round-trip. cmds — массив объектов: \
+                {kind:'lua',code:'...'} | {kind:'console',command:'...'}; для menu \
+                также {kind:'js'|'js_eval',code:'...'}, для srv/cl — shot/cam. \
+                Ответы склеиваются строками '[i] <result>'; асинхронные kind'ы \
+                отвечают под id '<cid>_<i>'."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "realm": {"type": "string", "enum": ["server", "client", "menu"]},
+                    "cmds": {"type": "array", "items": {"type": "object"},
+                             "description": "[{kind:'lua',code:'...'}|{kind:'console',command:'...'}]"},
+                },
+                "required": ["realm", "cmds"],
+            },
+        },
+        {
             "name": "gmod_screenshot",
             "description": (
                 "Скриншот. target='world' (default): сцена из произвольной точки мира \
@@ -367,7 +386,7 @@ fn wait_for(path: &Path, timeout: Duration) -> bool {
     while t0.elapsed() < timeout {
         if path.exists() {
             if let Ok(m1) = fs::metadata(path) {
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(10));
                 if let Ok(m2) = fs::metadata(path) {
                     if m2.len() == m1.len() {
                         return true;
@@ -375,7 +394,7 @@ fn wait_for(path: &Path, timeout: Duration) -> bool {
                 }
             }
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(15));
     }
     false
 }
@@ -432,7 +451,7 @@ fn read_out(cid: &str, timeout: Duration) -> Option<String> {
                 let _ = fs::remove_file(&path);
                 return Some(txt);
             }
-            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+            Err(_) => std::thread::sleep(Duration::from_millis(15)),
         }
     }
     Some("(could not read result file)".into())
@@ -492,7 +511,7 @@ fn read_out_menu(cid: &str, timeout: Duration) -> Option<String> {
         if total > 0 && chunks.len() >= total {
             break;
         }
-        std::thread::sleep(Duration::from_millis(60));
+        std::thread::sleep(Duration::from_millis(15));
     }
     if total == 0 || chunks.len() < total {
         return None;
@@ -712,6 +731,57 @@ fn gmod_menu(a: &Map<String, Value>) -> Result<String, String> {
             Duration::from_secs(15),
         ),
         other => return Err(uerr(U_MENU, format!("unknown action '{other}'"))),
+    })
+}
+
+/// Один round-trip на несколько команд: {"kind":"batch","cmds":[{kind,...}]}.
+/// Мост исполняет cmds по очереди и склеивает ответы строками "[i] <res>".
+/// Асинхронные kind'ы (js_eval, shot) пишут ответы под id '<cid>_<i>'.
+fn gmod_batch(realm: &str, cmds: &[Value]) -> Result<String, String> {
+    if cmds.is_empty() {
+        return Err(uerr(U_BATCH, "'cmds' must be a non-empty array of command objects"));
+    }
+    for (i, c) in cmds.iter().enumerate() {
+        if !c.is_object() {
+            return Err(uerr(U_BATCH, format!("cmds[{i}]: must be an object {{kind, ...}}")));
+        }
+        let kind = c.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        let allowed = match realm {
+            "menu" => matches!(kind, "lua" | "console" | "js" | "js_eval" | "shot"),
+            _ => matches!(kind, "lua" | "console" | "shot" | "cam"),
+        };
+        if !allowed {
+            return Err(uerr(
+                U_BATCH,
+                format!("cmds[{i}]: unsupported kind '{kind}' for realm '{realm}'"),
+            ));
+        }
+        let need = match kind {
+            "lua" | "js" | "js_eval" => Some("code"),
+            "console" => Some("command"),
+            _ => None,
+        };
+        if let Some(field) = need {
+            if c.get(field).and_then(|v| v.as_str()).map_or(true, str::is_empty) {
+                return Err(uerr(
+                    U_BATCH,
+                    format!("cmds[{i}]: kind '{kind}' requires '{field}'"),
+                ));
+            }
+        }
+    }
+    let mut p = Map::new();
+    p.insert("kind".into(), json!("batch"));
+    p.insert("cmds".into(), Value::Array(cmds.to_vec()));
+    let timeout = Duration::from_secs(15 + cmds.len() as u64 * 2);
+    Ok(if realm == "menu" {
+        menu_send(&mut p, timeout)
+    } else {
+        match write_cmd(realm, &mut p) {
+            Ok(cid) => read_out(&cid, timeout)
+                .unwrap_or_else(|| "TIMEOUT: no reply from game".into()),
+            Err(e) => e,
+        }
     })
 }
 
@@ -1018,9 +1088,15 @@ fn gmod_status() -> String {
     if !hl2_running() {
         return "gmod running=False bridge=n/a".into();
     }
+    // три реалма пингуем параллельно — иначе 3 последовательных
+    // round-trip'а утраивают задержку статуса
+    let handles: Vec<_> = ["server", "client", "menu"]
+        .iter()
+        .map(|r| (*r, std::thread::spawn(move || realm_alive(r, Duration::from_secs(5)))))
+        .collect();
     let mut realms = Map::new();
-    for r in ["server", "client", "menu"] {
-        let alive = realm_alive(r, Duration::from_secs(5));
+    for (r, h) in handles {
+        let alive = h.join().unwrap_or(false);
         let state = if alive { "alive" } else { "no response" };
         realms.insert(r.into(), json!(state));
     }
@@ -1322,6 +1398,18 @@ fn gmod_player(a: &Map<String, Value>) -> Result<String, String> {
             // клиент увидел бы уже повёрнутый сервером угол и добавил бы
             // дельту второй раз.
             let srv = format!("{}{}", PLAYER_PREFIX, body.replace("__P__", "p"));
+            if !truthy(a.get("rel")) {
+                // Абсолютные углы / точка мира: клиент может вычислить тот
+                // же код сам — реалмы независимы, исполняем параллельно.
+                let cl = format!(
+                    "local p = LocalPlayer() if not IsValid(p) then return 'no player' end {}",
+                    body.replace("__P__", "p")
+                );
+                let h = std::thread::spawn(move || gmod_lua("client", &cl, t15));
+                let rs = gmod_lua("server", &srv, t15);
+                let rc = h.join().unwrap_or_else(|_| "cl thread panicked".into());
+                return Ok(format!("{rs} | cl: {rc}"));
+            }
             let rs = gmod_lua("server", &srv, t15);
             let parsed = rs
                 .rsplit("=>")
@@ -1542,6 +1630,10 @@ fn uerr(usage: &str, msg: impl std::fmt::Display) -> String {
 
 const U_LUA: &str =
     "Usage: gmod_lua(realm='server'|'client'|'menu', code='<lua code>')";
+const U_BATCH: &str = "Usage: gmod_batch(realm='server'|'client'|'menu', \
+    cmds=[{kind:'lua',code:'...'}|{kind:'console',command:'...'}]) — \
+    multiple commands in one round trip; menu also accepts js/js_eval, \
+    srv/cl accept shot/cam; replies are joined as '[i] <result>'";
 const U_CONSOLE: &str =
     "Usage: gmod_console(realm='server'|'client'|'menu', command='<console command>')";
 const U_SCREENSHOT: &str = "Usage: gmod_screenshot(target='menu') or \
@@ -1586,6 +1678,15 @@ fn call_tool(params: &Map<String, Value>) -> Result<Vec<Value>, String> {
             req_str(args, "code", U_LUA)?,
             Duration::from_secs(15),
         ))]),
+        "gmod_batch" => {
+            let realm = req_str(args, "realm", U_BATCH)?;
+            let cmds = args
+                .get("cmds")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            Ok(vec![text(gmod_batch(realm, &cmds)?)])
+        }
         "gmod_screenshot" => {
             let (data, txt) = gmod_screenshot(args, Duration::from_secs(25));
             let mut out = vec![text(txt)];
@@ -1626,7 +1727,8 @@ fn call_tool(params: &Map<String, Value>) -> Result<Vec<Value>, String> {
         "gmod_player" => Ok(vec![text(gmod_player(args)?)]),
         "gmod_menu" => Ok(vec![text(gmod_menu(args)?)]),
         _ => Err(format!(
-            "UsageError: unknown tool '{name}'. Available tools: gmod_lua, gmod_screenshot, \
+            "UsageError: unknown tool '{name}'. Available tools: gmod_lua, gmod_batch, \
+             gmod_screenshot, \
              gmod_view, gmod_camera, gmod_errors, gmod_console, gmod_status, gmod_launch, \
              gmod_restart, gmod_map, gmod_display, gmod_player, gmod_menu"
         )),

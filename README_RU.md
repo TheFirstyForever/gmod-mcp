@@ -91,7 +91,7 @@ CARGO_TARGET_DIR=C:/Users/1/.cargo-target/gmod-mcp cargo build --release
 ```
 
 Префиксы реалмов: `cmd_srv_`, `cmd_cl_`, `cmd_menu_`. Poll-таймер
-(~0.25 с) сканирует каталог, читает файл, удаляет его, выполняет
+(~0.02 с) сканирует каталог, читает файл, удаляет его, выполняет
 команду, пишет ответ. Битый JSON отбрасывается молча (файл всё равно
 съедается).
 
@@ -116,9 +116,10 @@ console.log и работает надёжно.
 | kind | Поля | Эффект | Ответ |
 |---|---|---|---|
 | `lua` | `code` | `RunString` кода (в menu только RunString — CompileString/loadstring отсутствуют) в `pcall` | print-вывод + `=>` return |
-| `console` | `command` | `RunConsoleCommand(unpack(words))` | `menu console: <cmd>` / ack реалма |
+| `console` | `command` | server: `game.ConsoleCommand(str)`; client/menu: `RunConsoleCommand(unpack(words))` | `menu console: <cmd>` / `console: <cmd>` |
 | `shot` | `pos`,`ang`,`fov`,`hud`,`drawviewer` (карта) | рендерит и сохраняет скриншот | `shot_<id>.jpg` |
 | `cam` | `on`,`pos`,`ang`,`fov` | постоянная отладочная камера (client) | ack |
+| `batch` | `cmds` = массив команд-объектов | мультиплекс: N команд за один round-trip; ответы склеиваются `[i] <result>` | склеенный текст |
 
 **Только menu-реалм:**
 
@@ -253,6 +254,29 @@ gmod_lua(realm='server', code='return game.GetMap()')
 **Краевые случаи:** синтаксические ошибки → `SYNTAX: ...`; рантайм —
 `ERROR: ...`; в menu-реалме нет `CompileString`/`loadstring` — код
 идёт только через `RunString`.
+
+---
+
+## gmod_batch — несколько команд за один round-trip
+
+```
+gmod_batch(realm='server'|'client'|'menu',
+    cmds=[{kind:'lua',code:'...'} | {kind:'console',command:'...'}])
+```
+
+| Параметр | Тип | Обяз. | Примечание |
+|---|---|---|---|
+| realm | enum | да | см. таблицу реалмов |
+| cmds | array | да | объекты команд; для menu также `js`/`js_eval`, для srv/cl — `shot`/`cam` |
+
+**Возврат:** склеенные под-ответы строками `[i] <result>`. Под-команда
+без обязательного поля (`code`/`command`) → UsageError. Асинхронные
+kind'ы (`js_eval`, `shot`) отвечают под `<cid>_<i>` — внутрь склейки
+не попадают.
+
+**Краевые случаи:** вложенный `batch` отклоняется; консольные команды
+ставятся движком в очередь — чтение конвара сразу после его установки
+в том же батче видит старое значение.
 
 ---
 

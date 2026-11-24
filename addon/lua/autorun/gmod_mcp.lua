@@ -43,6 +43,31 @@ local function gmcp_write_out(id, text)
 end
 
 local function gmcp_handle(cmd)
+    if cmd.kind == "batch" and type(cmd.cmds) == "table" then
+        -- мультиплекс: много команд за один round-trip;
+        -- sub-ответы помечаются [i], асинхронные (shot) — под id_<i>
+        local parts = {}
+        for i, sub in ipairs(cmd.cmds) do
+            sub.id = sub.id or (cmd.id .. "_" .. i)
+            local r = gmcp_handle(sub)
+            if r ~= nil then parts[#parts + 1] = "[" .. i .. "] " .. tostring(r) end
+        end
+        return table.concat(parts, "\n")
+    end
+    if cmd.kind == "console" then
+        -- server: game.ConsoleCommand(полная строка);
+        -- client: RunConsoleCommand(пары имя, арг)
+        local okc, errc
+        if SERVER then
+            okc, errc = pcall(game.ConsoleCommand, cmd.command or "")
+        else
+            local parts = {}
+            for p in string.gmatch(cmd.command or "", "%S+") do parts[#parts + 1] = p end
+            okc, errc = pcall(RunConsoleCommand, unpack(parts))
+        end
+        return okc and ("console: " .. tostring(cmd.command))
+            or ("ERROR: " .. tostring(errc))
+    end
     if CLIENT and cmd.kind == "shot" then
         -- Камера ставится немедленно; кадр снимется в PostRender
         GMOD_MCP.Cam = {
@@ -73,7 +98,7 @@ local function gmcp_handle(cmd)
 end
 
 -- Поллер команд: каждый реалм забирает только свои cmd_<realm>_*.json
-timer.Create("GmodMcpPoll_" .. realm, 0.25, 0, function()
+timer.Create("GmodMcpPoll_" .. realm, 0.02, 0, function()
     local files = file.Find(GMOD_MCP.Dir .. "/cmd_" .. realm .. "_*.json", "DATA")
     if not files then return end
     for _, f in ipairs(files) do
